@@ -53,6 +53,42 @@ Function Get-GoogleMetadata() {
         }
 }
 
+Function Set-SecretManagerPassword() {
+	Param(
+		[Parameter(Mandatory=$True)][String] $SecretPath,
+        [Parameter(Mandatory=$True)][String] $SecretData
+	)
+		
+	$Bytes = [System.Text.Encoding]::UTF8.GetBytes($SecretData)
+	$EncodedText =[Convert]::ToBase64String($Bytes)
+
+	$secret = @{
+		"payload" = @{
+			"data" = $EncodedText;
+		}
+	}
+
+	$requestBody = $secret | ConvertTo-Json
+
+	$apiToken = Get-GoogleMetadata "instance/service-accounts/default/token"
+	$secretUrl = 'https://secretmanager.googleapis.com/v1beta1/' + $SecretPath + ':addVersion'
+
+	$headers = @{
+		'content-type' = 'application/json'
+		'Authorization' = 'Bearer '+ $apiToken.access_token
+	}
+	
+	Try {
+        Write-Host "Setting password set for $SecretPath"
+		Return Invoke-RestMethod -Headers $headers -Uri $secretUrl -Method POST -Body $requestBody
+
+	}
+	Catch {
+		Write-Host "Failed to set secret for $SecretPath"
+		Return $Null
+	}
+}
+
 
 Write-Host "Bootstrap script started..."
 
@@ -60,16 +96,13 @@ Write-Host "Installing AD features..."
 Install-WindowsFeature -name AD-Domain-Services -IncludeManagementTools
 
 Write-Host "Fetching metadata parameters..."
-$Domain = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/domain-name
-$NetBiosName = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/netbios-name
-$KmsKey = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/kms-key
-$GcsPrefix = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/gcs-prefix
-$Region = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/region
-$KmsRegion = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/keyring-region
-$Keyring = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/keyring
-#$RuntimeConfig = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/runtime-config
-
-Write-Host "KMS Key has been fetched"
+$Domain = Get-GoogleMetadata "instance/attributes/domain-name" 
+$NetBiosName = Get-GoogleMetadata "instance/attributes/netbios-name"
+$GcsPrefix = Get-GoogleMetadata "instance/attributes/gcs-prefix"
+$Region = Get-GoogleMetadata "instance/attributes/region"
+$SecretManagerSafeMode = Get-GoogleMetadata "instance/attributes/safe-mode-admin-pw"
+$SecretManagerLocalAdmin = Get-GoogleMetadata "instance/attributes/local-admin-pw"
+$ProjectId = Get-GoogleMetadata 'project/project-id'
 
 Write-Host "Configuring admin credentials..."
 $SafeModeAdminPassword = New-RandomPassword
@@ -78,19 +111,15 @@ $LocalAdminPassword = New-RandomPassword
 Set-LocalUser Administrator -Password $LocalAdminPassword
 Enable-LocalUser Administrator
 
-Write-Host "Saving encrypted credentials in GCS..."
-If ($GcsPrefix.EndsWith("/")) {
-  $GcsPrefix = $GcsPrefix -Replace ".$"
-}
-$TempFile = New-TemporaryFile
+Write-Host "Writing to secrets manager..."
 
-Unwrap-SecureString $LocalAdminPassword | gcloud kms encrypt --key $KmsKey --plaintext-file - --ciphertext-file $TempFile.FullName --location $KmsRegion  --keyring $Keyring
-gsutil cp $TempFile.FullName "$GcsPrefix/output/domain-admin-password.bin"
+$safeModeSecretPath = 'projects/'+$ProjectId+'/secrets/'+$SecretManagerSafeMode
+$safeModeAdminPasswordUnwrap = Unwrap-SecureString $SafeModeAdminPassword 
+Set-SecretManagerPassword -SecretPath $safeModeSecretPath -SecretData $safeModeAdminPasswordUnwrap
 
-Unwrap-SecureString $SafeModeAdminPassword | gcloud kms encrypt --key $KmsKey --plaintext-file - --ciphertext-file $TempFile.FullName --location $KmsRegion --keyring $Keyring
-gsutil cp $TempFile.FullName "$GcsPrefix/output/dsrm-admin-password.bin"
-
-Remove-Item $TempFile.FullName -Force
+$localAdminSecretPath = 'projects/'+$ProjectId+'/secrets/'+$SecretManagerLocalAdmin
+$localAdminPasswordUnwrap = Unwrap-SecureString $LocalAdminPassword 
+Set-SecretManagerPassword -SecretPath $localAdminSecretPath -SecretData $localAdminPasswordUnwrap
 
 Write-Host "Waiting for background jobs..."
 Get-Job | Wait-Job
@@ -108,8 +137,8 @@ $Params = @{
 Install-ADDSForest @Params
 
 Write-Host "Configuring startup metadata..."
-$name = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/name
-$zone = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/zone
+$name = Get-GoogleMetadata "instance/name"
+$zone = Get-GoogleMetadata "instance/zone"
 gcloud compute instances add-metadata "$name" --zone $zone --metadata windows-startup-script-url="$GcsPrefix/powershell/bootstrap/primary-domain-controller-step-2.ps1"
 
 Write-Host "Restarting computer after step 1 ..."

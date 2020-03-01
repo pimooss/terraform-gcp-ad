@@ -55,6 +55,27 @@ Function Get-GoogleMetadata() {
     }
 }
 
+Function Get-SecretManagerPassword() {
+	Param(
+		[Parameter(Mandatory=$True)][String] $SecretPath
+	)
+
+    $apiToken = Get-GoogleMetadata "instance/service-accounts/default/token"
+    $secretUrl = 'https://secretmanager.googleapis.com/v1beta1/' + $SecretPath + '/versions/latest:access'
+	
+	Try {
+        $secretBase64 = Invoke-RestMethod -Headers @{ "Authorization" = "Bearer "+ $apiToken.access_token } -Uri $secretUrl
+        $secret = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secretBase64.payload.data))
+        Write-Host "Password retrieved for $SecretPath"
+        Return $secret.ToString().trim()
+
+	}
+	Catch {
+		Write-Host "Failed to get secret for $SecretPath"
+		Return $Null
+	}
+}
+
 Write-Host "Bootstrap script started..."
 
 $name = Get-GoogleMetadata "instance/name"
@@ -76,49 +97,38 @@ $LocalAdminCredentials = New-Object `
     -TypeName System.Management.Automation.PSCredential `
     -ArgumentList "\Administrator",$LocalAdminPassword
 
-Invoke-Command -Credential $LocalAdminCredentials -ComputerName . -ScriptBlock {
+Write-Host "Fetching metadata parameters..."
+$Domain = Get-GoogleMetadata "instance/attributes/domain-name" 
+$NetBiosName = Get-GoogleMetadata "instance/attributes/netbios-name"
+$GcsPrefix = Get-GoogleMetadata "instance/attributes/gcs-prefix"
+$Region = Get-GoogleMetadata "instance/attributes/region"
+$SecretManagerSafeMode = Get-GoogleMetadata "instance/attributes/safe-mode-admin-pw"
+$SecretManagerLocalAdmin = Get-GoogleMetadata "instance/attributes/local-admin-pw"
+$ProjectId = Get-GoogleMetadata 'project/project-id'
 
-    Write-Host "Getting job metadata..."
-    $Domain = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/domain-name
-    $NetBiosName = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/netbios-name
-    $KmsKey = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/kms-key
-    $KmsRegion = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/keyring-region
-    $Region = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/region
-    $Keyring = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/keyring
-    $GcsPrefix = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/attributes/gcs-prefix
-
-    Write-Host "Waiting on domain [$Domain] to be ready"
+Write-Host "Waiting on domain [$Domain] to be ready"
+$TestConnection = Test-NetConnection $Domain
+While (!($TestConnection.PingSucceeded)) {
+    Write-Host (Get-Date -Format 'HH:mm:ss') ": [$env:COMPUTERNAME] Waiting for connectivity to [$Domain]"
+    Sleep -Seconds 5
+    Clear-DnsClientCache -Confirm:$false
     $TestConnection = Test-NetConnection $Domain
-    While (!($TestConnection.PingSucceeded)) {
-        Write-Host (Get-Date -Format 'HH:mm:ss') ": [$env:COMPUTERNAME] Waiting for connectivity to [$Domain]"
-        Sleep -Seconds 5
-        Clear-DnsClientCache -Confirm:$false
-        $TestConnection = Test-NetConnection $Domain
-    }
+}
 
-    Write-Host "Fetching admin credentials..."
+Write-Host "Domain is $Domain"
 
-    # fetch domain admin credentials
-    If ($GcsPrefix.EndsWith("/")) {
-    $GcsPrefix = $GcsPrefix -Replace ".$"
-    }
-    $TempFile = New-TemporaryFile
+Write-Host "Fetching admin credentials..."
+$localAdminSecretPath = 'projects/'+$ProjectId+'/secrets/'+$SecretManagerLocalAdmin
+$DomainAdminPassword = Get-SecretManagerPassword -SecretPath $localAdminSecretPath  | ConvertTo-SecureString -AsPlainText -Force
 
-    # invoke-command sees gsutil output as an error so redirect stderr to stdout and stringify to suppress
-    gsutil cp $GcsPrefix/output/domain-admin-password.bin $TempFile.FullName 2>&1 | %{ "$_" }
-
-    $DomainAdminPassword = $(gcloud kms decrypt --key $KmsKey --location $KmsRegion --keyring $Keyring --ciphertext-file $TempFile.FullName --plaintext-file - | ConvertTo-SecureString -AsPlainText -Force)
-
-    Remove-Item $TempFile.FullName
-    Write-Host "Domain is $Domain"
+Invoke-Command -Credential $LocalAdminCredentials -ComputerName . -ScriptBlock {
 
     $DomainAdminCredentials = New-Object `
             -TypeName System.Management.Automation.PSCredential `
-            -ArgumentList "$Domain\Administrator", $DomainAdminPassword
+            -ArgumentList "$Using:Domain\Administrator", $Using:DomainAdminPassword
 
     Write-Host "Joining domain... using credential $($DomainAdminCredentials.UserName)"
-    Add-Computer -DomainName $Domain -Credential $DomainAdminCredentials
-
+    Add-Computer -DomainName $Using:Domain -Credential $DomainAdminCredentials
 }
 
 Add-Type -AssemblyName System.Web

@@ -216,6 +216,7 @@ resource "google_compute_instance" "dc_2" {
     region                     = local.region
     safe-mode-admin-pw         = google_secret_manager_secret.safe_mode_admin_pw.secret_id
     local-admin-pw             = google_secret_manager_secret.local_admin_pw.secret_id
+    pdc-ip                     = google_compute_instance.dc_1.network_interface.0.network_ip
     gcs-prefix                 = local.gcs-prefix
     netbios-name               = local.dc-netbios-name
     project-id                 = local.this-project-id
@@ -248,6 +249,12 @@ resource "google_dns_managed_zone" "forwarding" {
   dns_name    = "${local.domain}."
   description = "Terraform-managed zone."
   visibility  = "private"
+
+  private_visibility_config {
+    networks {
+      network_url = "https://www.googleapis.com/compute/v1/projects/${var.network_project_id}/global/networks/${var.network_name}"
+    }
+  }
 
   forwarding_config {
     target_name_servers {

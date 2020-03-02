@@ -105,17 +105,23 @@ $Region = Get-GoogleMetadata "instance/attributes/region"
 $SecretManagerSafeMode = Get-GoogleMetadata "instance/attributes/safe-mode-admin-pw"
 $SecretManagerLocalAdmin = Get-GoogleMetadata "instance/attributes/local-admin-pw"
 $ProjectId = Get-GoogleMetadata 'project/project-id'
+$PdcIp = Get-GoogleMetadata "instance/attributes/pdc-ip"
 
 Write-Host "Waiting on domain [$Domain] to be ready"
-$TestConnection = Test-NetConnection $Domain
-While (!($TestConnection.PingSucceeded)) {
+$TestConnection = Resolve-DnsName -Name $Domain -Server $PdcIp -DnsOnly
+While (!($TestConnection.Count -gt 0)) {
     Write-Host (Get-Date -Format 'HH:mm:ss') ": [$env:COMPUTERNAME] Waiting for connectivity to [$Domain]"
     Sleep -Seconds 5
     Clear-DnsClientCache -Confirm:$false
-    $TestConnection = Test-NetConnection $Domain
+    $TestConnection = Resolve-DnsName -Name $Domain -Server $PdcIp -DnsOnly
 }
-
 Write-Host "Domain is $Domain"
+# Workaround to give first domain controller to come online
+# TODO: Implement something more robust for this
+Write-Host "Sleep for 5 minutes..."
+Start-Sleep -Seconds 300
+Write-Host "Set DNS to point at PDC..."
+Set-DnsClientServerAddress -InterfaceAlias Ethernet -ServerAddresses ($PdcIp)
 
 Write-Host "Fetching admin credentials..."
 $localAdminSecretPath = 'projects/'+$ProjectId+'/secrets/'+$SecretManagerLocalAdmin

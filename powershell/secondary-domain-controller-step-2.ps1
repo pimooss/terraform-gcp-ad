@@ -100,7 +100,7 @@ $LocalAdminCredentials = New-Object `
     -TypeName System.Management.Automation.PSCredential `
     -ArgumentList "\Administrator",$LocalAdminPassword
 
-    Write-Host "Fetching metadata parameters..."
+Write-Host "Fetching metadata parameters..."
 
 $Domain = Get-GoogleMetadata "instance/attributes/domain-name" 
 $NetBiosName = Get-GoogleMetadata "instance/attributes/netbios-name"
@@ -120,21 +120,21 @@ $SafeModeAdminPassword = Get-SecretManagerPassword -SecretPath $safeModeSecretPa
 
 Invoke-Command -Credential $LocalAdminCredentials -ComputerName . -ScriptBlock {
     
-    Write-Host "Domain is $Domain"
+    Write-Host "Domain is $Using:Domain"
 
     $DomainAdminCredentials = New-Object `
             -TypeName System.Management.Automation.PSCredential `
-            -ArgumentList "$Domain\Administrator", $DomainAdminPassword
+            -ArgumentList "$Using:Domain\Administrator", $Using:DomainAdminPassword
 
     Write-Host "{Promoting DC... using credential $($DomainAdminCredentials.User)}"
 
     Write-Host "Creating DC in AD forest..."
 
     $Params = @{
-        DomainName = $Domain
+        DomainName = $Using:Domain
         InstallDNS = $True
         NoRebootOnCompletion = $True
-        SafeModeAdministratorPassword = $SafeModeAdminPassword
+        SafeModeAdministratorPassword = $Using:SafeModeAdminPassword
         SiteName = "Default-First-Site-Name"
         Force = $True
         Credential = $DomainAdminCredentials
@@ -142,6 +142,9 @@ Invoke-Command -Credential $LocalAdminCredentials -ComputerName . -ScriptBlock {
     Install-ADDSDomainController @Params
 
 }
+
+Write-Host "Reset DNS settings..."
+Set-DnsClientServerAddress -InterfaceAlias Ethernet -ResetServerAddresses
 
 Write-Host "Configuring startup metadata..."
 # remove startup script from metadata to prevent rerun on reboot

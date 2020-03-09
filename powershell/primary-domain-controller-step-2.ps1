@@ -14,6 +14,10 @@
 #  limitations under the License.
 #
 
+Import-Module GoogleCloud
+
+##### Helper Functions #####
+
 Function Get-RuntimeConfigWaiter {
 	Param(
 		[Parameter(Mandatory=$True)][String] $ConfigPath,
@@ -35,29 +39,58 @@ Function Get-RuntimeConfigWaiter {
 	Return Invoke-RestMethod @Params
 }
 
-Write-Host "Configuring NTP..."
-# use google internal time server
-w32tm /config /manualpeerlist:"metadata.google.internal" /syncfromflags:manual /reliable:yes /update
+##### Helper Functions #####
 
-# poll domain controller until it appears ready
-Do {
-  Try {
-    $test = Get-ADDomain
-  }
-  Catch {
-      Write-Host "Waiting for DC to become available..."
-      Sleep 15
-  }
+##### Bootstrap Functions #####
+
+Function Set-GoogleNTPServer() {
+	Write-Output ""
+	Write-Output "Configuring NTP..."
+	# use google internal time server
+	w32tm /config /manualpeerlist:"metadata.google.internal" /syncfromflags:manual /reliable:yes /update
+
+	$attempts = 0
+	$maxAttempts = 5
+	# poll domain controller until it appears ready using exponential backoff
+	Do {
+		Try {
+			$test = Get-ADDomain
+		}
+		Catch {
+			$attempts++
+			$retryDelaySeconds = [math]::Pow(2,$attempts)
+			Write-Output "Waiting for DC to become available. Retrying in $retryDelaySeconds seconds"
+			Start-Sleep -Seconds $retryDelaySeconds
+		}
+	}
+	Until ($test)
 }
-Until ($test)
 
+Function Set-Bootstrap-Script() {
+	# remove startup script from metadata to prevent rerun on reboot
+	$baseURI = "http://169.254.169.254/computeMetadata/v1"
+	$MetadataHeader = @{"Metadata-Flavor" = "Google"}
 
-Write-Host "Configuring startup metadata..."
-# remove startup script from metadata to prevent rerun on reboot
-$name = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/name
-$zone = Invoke-RestMethod -Headers @{"Metadata-Flavor" = "Google"} -Uri http://169.254.169.254/computeMetadata/v1/instance/zone
-gcloud compute instances remove-metadata "$name" --zone $zone --keys windows-startup-script-url
+	$name = Invoke-RestMethod -Headers $MetadataHeader -Uri "$baseURI/instance/name"
+	$zone = Invoke-RestMethod -Headers $MetadataHeader -Uri "$baseURI/instance/zone"
+	$metadataKey = "windows-startup-script-url"
 
-Write-Host "Signaling completion..."
+	Set-GceInstance -Name $name -Zone $zone -RemoveMetadata $metadataKey
+}
 
-Write-Host "Step 2 completed"
+Function __main__() {
+	Write-Output ""
+	Write-Output ">>> Bootstrap script started... <<<"
+	Set-GoogleNTPServer
+
+	Write-Output ""
+	Write-Output ">>> Configuring startup metadata... <<<"
+	Set-Bootstrap-Script
+
+	Write-Output ""
+	Write-Output ">>> Step 2 completed... <<<"
+}
+# Script enters here
+__main__
+
+##### Bootstrap Functions #####

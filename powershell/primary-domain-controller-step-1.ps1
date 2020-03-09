@@ -14,6 +14,10 @@
 #  limitations under the License.
 #
 
+Import-Module GoogleCloud
+
+##### Helper Functions #####
+
 Function New-RandomString {
 	Param(
 		[int] $Length = 10,
@@ -79,68 +83,114 @@ Function Set-SecretManagerPassword() {
 	}
 	
 	Try {
-        Write-Host "Setting password set for $SecretPath"
+        Write-Output "Setting password set for $SecretPath"
 		Return Invoke-RestMethod -Headers $headers -Uri $secretUrl -Method POST -Body $requestBody
 
 	}
 	Catch {
-		Write-Host "Failed to set secret for $SecretPath"
+		Write-Output "Failed to set secret for $SecretPath"
 		Return $Null
 	}
 }
 
+##### Helper Functions #####
 
-Write-Host "Bootstrap script started..."
+##### Bootstrap Functions #####
 
-Write-Host "Installing AD features..."
-Install-WindowsFeature -name AD-Domain-Services -IncludeManagementTools
-
-Write-Host "Fetching metadata parameters..."
-$Domain = Get-GoogleMetadata "instance/attributes/domain-name" 
-$NetBiosName = Get-GoogleMetadata "instance/attributes/netbios-name"
-$GcsPrefix = Get-GoogleMetadata "instance/attributes/gcs-prefix"
-$Region = Get-GoogleMetadata "instance/attributes/region"
-$SecretManagerSafeMode = Get-GoogleMetadata "instance/attributes/safe-mode-admin-pw"
-$SecretManagerLocalAdmin = Get-GoogleMetadata "instance/attributes/local-admin-pw"
-$ProjectId = Get-GoogleMetadata 'project/project-id'
-
-Write-Host "Configuring admin credentials..."
-$SafeModeAdminPassword = New-RandomPassword
-$LocalAdminPassword = New-RandomPassword
-
-Set-LocalUser Administrator -Password $LocalAdminPassword
-Enable-LocalUser Administrator
-
-Write-Host "Writing to secrets manager..."
-
-$safeModeSecretPath = 'projects/'+$ProjectId+'/secrets/'+$SecretManagerSafeMode
-$safeModeAdminPasswordUnwrap = Unwrap-SecureString $SafeModeAdminPassword 
-Set-SecretManagerPassword -SecretPath $safeModeSecretPath -SecretData $safeModeAdminPasswordUnwrap
-
-$localAdminSecretPath = 'projects/'+$ProjectId+'/secrets/'+$SecretManagerLocalAdmin
-$localAdminPasswordUnwrap = Unwrap-SecureString $LocalAdminPassword 
-Set-SecretManagerPassword -SecretPath $localAdminSecretPath -SecretData $localAdminPasswordUnwrap
-
-Write-Host "Waiting for background jobs..."
-Get-Job | Wait-Job
-
-Write-Host "Creating AD forest..."
-
-$Params = @{
-	DomainName = $Domain
-	DomainNetbiosName = $NetBiosName
-	InstallDNS = $True
-	NoRebootOnCompletion = $True
-	SafeModeAdministratorPassword = $SafeModeAdminPassword
-	Force = $True
+#TODO: Convert to powershell DSC
+Function Install-ADDSFeature() {
+	Write-Output ""
+	Write-Output "Installing AD features..."
+	Install-WindowsFeature -name AD-Domain-Services -IncludeManagementTools
 }
-Install-ADDSForest @Params
 
-Write-Host "Configuring startup metadata..."
-$name = Get-GoogleMetadata "instance/name"
-$zone = Get-GoogleMetadata "instance/zone"
-gcloud compute instances add-metadata "$name" --zone $zone --metadata windows-startup-script-url="$GcsPrefix/powershell/bootstrap/primary-domain-controller-step-2.ps1"
+Function Initialize-ADEnvironment() {
+	Install-ADDSFeature
+	
+	Write-Output ""
+	Write-Output "Fetching metadata parameters..."
+	$script:Domain = Get-GoogleMetadata -Path "instance/attributes/domain-name" 
+	$script:NetBiosName = Get-GoogleMetadata -Path "instance/attributes/netbios-name"
+	$script:GcsPrefix = Get-GoogleMetadata -Path "instance/attributes/gcs-prefix"
+	$script:Region = Get-GoogleMetadata -Path "instance/attributes/region"
+	$script:SecretManagerSafeMode = Get-GoogleMetadata -Path "instance/attributes/safe-mode-admin-pw"
+	$script:SecretManagerLocalAdmin = Get-GoogleMetadata -Path "instance/attributes/local-admin-pw"
+	$script:ProjectId = Get-GoogleMetadata -Path 'project/project-id'
+}
 
-Write-Host "Restarting computer after step 1 ..."
+Function Initialize-ADForest() {
+	Write-Output ""
+	Write-Output "Creating AD forest..."
 
-Restart-Computer
+	$Params = @{
+		DomainName = $Domain
+		DomainNetbiosName = $NetBiosName
+		InstallDNS = $True
+		NoRebootOnCompletion = $True
+		SafeModeAdministratorPassword = $SafeModeAdminPassword
+		Force = $True
+	}
+
+	Install-ADDSForest @Params
+}
+
+# Generates AD Safemode password and set new pw for local admin SID-500 account
+Function Initialize-localPasswords() {
+	Write-Output ""
+	Write-Output "Configuring admin credentials..."
+	$script:SafeModeAdminPassword = New-RandomPassword
+	$script:LocalAdminPassword = New-RandomPassword
+
+	Set-LocalUser Administrator -Password $LocalAdminPassword
+	Enable-LocalUser Administrator
+}
+
+# Stores generated runtime passwords in google secrets manager
+Function Initialize-ADPasswords-SecretsManager() {
+	Write-Output ""
+	Write-Output "Writing to secrets manager..."
+
+	$safeModeSecretPath = 'projects/'+$ProjectId+'/secrets/'+$SecretManagerSafeMode
+	$safeModeAdminPasswordUnwrap = Unwrap-SecureString $SafeModeAdminPassword 
+	Set-SecretManagerPassword -SecretPath $safeModeSecretPath -SecretData $safeModeAdminPasswordUnwrap
+
+	$localAdminSecretPath = 'projects/'+$ProjectId+'/secrets/'+$SecretManagerLocalAdmin
+	$localAdminPasswordUnwrap = Unwrap-SecureString $LocalAdminPassword 
+	Set-SecretManagerPassword -SecretPath $localAdminSecretPath -SecretData $localAdminPasswordUnwrap
+}
+
+Function Set-Bootstrap-Script() {
+	Write-Output ""
+	Write-Output "Configuring startup metadata..."
+	$name = Get-GoogleMetadata -Path "instance/name"
+	$zone = Get-GoogleMetadata -Path "instance/zone"
+	$metadata = @{"windows-startup-script-url" = "$GcsPrefix/powershell/bootstrap/primary-domain-controller-step-2.ps1"}
+	
+	Set-GceInstance -Name $name -Zone $zone -AddMetadata $metadata
+}
+
+Function __main__() {
+	Write-Output ""
+	Write-Output ">>> Bootstrap script started... <<<"
+	Initialize-ADEnvironment
+	Initialize-localPasswords
+	Initialize-ADPasswords-SecretsManager
+	Initialize-ADForest
+
+	Write-Output ""
+	Write-Output ">>> Waiting for background jobs... <<<"
+	Get-Job | Wait-Job
+
+	Write-Output ""
+	Write-Output ">>> Setting instance meta for post install/second bootstrap script... <<<"
+	Set-Bootstrap-Script
+
+	Write-Output ""
+	Write-Output ">>> Restarting computer to complete bootstrap script... <<<"
+	# final reboot to finish installing AD features
+	Restart-Computer
+}
+# Script enters here
+__main__
+
+##### Bootstrap Functions #####
